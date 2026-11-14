@@ -50,7 +50,11 @@ jumplens.exe --standard          limit the scan to the usual Recent folders
 In the window:
 
 - the summary strip counts jump lists, entries, pinned entries and the time range; the histogram is a filter
-- the left rail lists every source file ordered by number of entries, and switches between scan modes
+- the left rail lists every source file ordered by number of entries, and switches between scan modes; drag its
+  right edge to widen it
+- right-click a row to open a menu: `Open folder` reveals the entry's target in Explorer (`/select` with the file
+  selected; the containing folder if the file is gone, or the jump list file itself for shell items), `Copy path`
+  copies the target path, `Copy jump list path` copies the source file path
 - two filters sit under the scan mode switch:
   - `In instance only` keeps only entries dated since this boot of the PC
   - `Reduce noise` hides entries whose target file is a Windows executable that verifies as Microsoft Windows

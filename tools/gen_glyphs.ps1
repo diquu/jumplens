@@ -13,7 +13,9 @@ $glyphs = @(
     @{ Name = "kGlyphSearch"; File = "magnifier.svg" },
     @{ Name = "kGlyphRefresh"; File = "refresh.svg" },
     @{ Name = "kGlyphDownload"; File = "download.svg" },
-    @{ Name = "kGlyphEmpty"; File = "list-magnifying-glass.svg" }
+    @{ Name = "kGlyphEmpty"; File = "list-magnifying-glass.svg" },
+    @{ Name = "kGlyphFolder"; File = "folder.svg" },
+    @{ Name = "kGlyphCopy"; File = "copy.svg" }
 )
 
 $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"

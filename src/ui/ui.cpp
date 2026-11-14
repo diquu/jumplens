@@ -12,12 +12,14 @@
 #include <dwrite.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -105,6 +107,8 @@ struct App {
     ID2D1Bitmap* glyphRefresh = nullptr;
     ID2D1Bitmap* glyphDownload = nullptr;
     ID2D1Bitmap* glyphEmpty = nullptr;
+    ID2D1Bitmap* glyphFolder = nullptr;
+    ID2D1Bitmap* glyphCopy = nullptr;
     ID2D1LinearGradientBrush* brushHistogram = nullptr;
     IDWriteInlineObject* ellipsis = nullptr;
 
@@ -164,6 +168,16 @@ struct App {
     float colAppW = -1.0f;
     float colTargetW = -1.0f;
     float colCountW = -1.0f;
+    float railW = 264.0f;
+    bool hoverRailSep = false;
+    bool dragRail = false;
+    float dragRailStartX = 0.0f;
+    float dragRailBase = 0.0f;
+    bool contextOpen = false;
+    int contextPosition = -1;
+    float contextX = 0.0f;
+    float contextY = 0.0f;
+    int hoverContextItem = -1;
     int dragSep = -1;
     int hoverSep = -1;
     float dragStartX = 0.0f;
@@ -310,6 +324,8 @@ struct App {
         glyphRefresh = tinted_mask(kGlyphRefresh, kDim);
         glyphDownload = tinted_mask(kGlyphDownload, kAmber);
         glyphEmpty = tinted_mask(kGlyphEmpty, kAmber);
+        glyphFolder = tinted_mask(kGlyphFolder, kDim);
+        glyphCopy = tinted_mask(kGlyphCopy, kDim);
 
         D2D1_GRADIENT_STOP stops[2] = {};
         stops[0] = {0.0f, rgb(0xF6C964)};
@@ -330,7 +346,7 @@ struct App {
             brushHistogram = nullptr;
         }
         for (ID2D1Bitmap** bitmap : {&logo, &glyphSearch, &glyphSearchAmber, &glyphRefresh, &glyphDownload,
-                                     &glyphEmpty}) {
+                                     &glyphEmpty, &glyphFolder, &glyphCopy}) {
             if (*bitmap != nullptr) {
                 (*bitmap)->Release();
                 *bitmap = nullptr;
@@ -417,9 +433,18 @@ struct App {
     void export_csv();
     int entry_at(float y);
     int separator_at(float x, float y) const;
+    bool rail_separator_at(float x, float y) const;
+    int context_item_at(float x, float y) const;
+    void paint_context();
+    void on_context_menu(float x, float y);
+    void execute_context(int item);
+    std::wstring context_open_base() const;
+    bool context_item_enabled(int item) const;
+    void copy_text(const std::wstring& text);
     void ensure_visible(int position);
     const Entry* selected_entry() const;
     const SourceInfo* source_of(const Entry& entry) const;
+    const Entry* context_entry() const;
     std::wstring mode_text() const;
 };
 
@@ -472,7 +497,7 @@ void App::compute_layout() {
     float topH = 64.0f;
     float summaryH = 78.0f;
     float statusH = 26.0f;
-    float railW = 264.0f;
+    railW = std::min(std::max(railW, 200.0f), 420.0f);
     float drawerW = 396.0f;
 
     layout.top = D2D1::RectF(0.0f, 0.0f, width, topH);
@@ -597,6 +622,8 @@ void App::rebuild_buckets() {
 }
 
 void App::rebuild() {
+    contextOpen = false;
+    hoverContextItem = -1;
     rebuild_buckets();
     if (!dayFilter.empty()) {
         bool present = false;
@@ -821,6 +848,160 @@ int App::separator_at(float x, float y) const {
     return -1;
 }
 
+bool App::rail_separator_at(float x, float y) const {
+    return x >= layout.rail.right - 5.0f && x <= layout.rail.right + 5.0f && y >= layout.rail.top &&
+           y <= layout.rail.bottom;
+}
+
+const Entry* App::context_entry() const {
+    if (contextPosition < 0 || contextPosition >= static_cast<int>(visible.size())) {
+        return nullptr;
+    }
+    return &dataset.entries[static_cast<size_t>(visible[static_cast<size_t>(contextPosition)])];
+}
+
+std::wstring App::context_open_base() const {
+    const Entry* entry = context_entry();
+    if (entry == nullptr) {
+        return L"";
+    }
+    if (filesystem_path(entry->target)) {
+        return entry->target;
+    }
+    const SourceInfo* source = source_of(*entry);
+    if (source != nullptr && filesystem_path(source->path)) {
+        return source->path;
+    }
+    return L"";
+}
+
+bool App::context_item_enabled(int item) const {
+    const Entry* entry = context_entry();
+    if (entry == nullptr) {
+        return false;
+    }
+    const SourceInfo* source = source_of(*entry);
+    if (item == 0) {
+        std::wstring base = context_open_base();
+        if (base.empty()) {
+            return false;
+        }
+        DWORD attributes = GetFileAttributesW(base.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            return true;
+        }
+        std::wstring parent = parent_of(base);
+        return !parent.empty() && GetFileAttributesW(parent.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    if (item == 1) {
+        return !entry->target.empty();
+    }
+    if (item == 2) {
+        return source != nullptr && !source->path.empty();
+    }
+    return false;
+}
+
+void App::copy_text(const std::wstring& text) {
+    if (text.empty() || !OpenClipboard(window)) {
+        return;
+    }
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(bytes));
+    if (memory != nullptr) {
+        void* destination = GlobalLock(memory);
+        if (destination != nullptr) {
+            memcpy(destination, text.c_str(), bytes);
+            GlobalUnlock(memory);
+            SetClipboardData(CF_UNICODETEXT, memory);
+        } else {
+            GlobalFree(memory);
+        }
+    }
+    CloseClipboard();
+}
+
+int App::context_item_at(float x, float y) const {
+    if (!contextOpen) {
+        return -1;
+    }
+    float itemH = 30.0f;
+    float top = contextY + 6.0f;
+    float width = 200.0f;
+    if (x < contextX || x > contextX + width) {
+        return -1;
+    }
+    int index = static_cast<int>((y - top) / itemH);
+    if (index < 0 || index > 2) {
+        return -1;
+    }
+    return index;
+}
+
+void App::execute_context(int item) {
+    const Entry* entry = context_entry();
+    if (entry == nullptr) {
+        return;
+    }
+    const SourceInfo* source = source_of(*entry);
+    if (item == 0) {
+        std::wstring base = context_open_base();
+        if (base.empty()) {
+            return;
+        }
+        std::wstring params;
+        DWORD attributes = GetFileAttributesW(base.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            params = L"\"" + base + L"\"";
+        } else if (attributes != INVALID_FILE_ATTRIBUTES) {
+            params = L"/select,\"" + base + L"\"";
+        } else {
+            std::wstring parent = parent_of(base);
+            if (parent.empty() || GetFileAttributesW(parent.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                return;
+            }
+            params = L"\"" + parent + L"\"";
+        }
+        ShellExecuteW(window, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (item == 1) {
+        copy_text(entry->target);
+        return;
+    }
+    if (item == 2 && source != nullptr) {
+        copy_text(source->path);
+    }
+}
+
+void App::on_context_menu(float x, float y) {
+    if (contextOpen && context_item_at(x, y) >= 0) {
+        return;
+    }
+    if (y > layout.header.bottom && y < layout.table.bottom && x > layout.table.left && x < layout.table.right) {
+        int position = entry_at(y);
+        if (position >= 0) {
+            contextPosition = position;
+            contextX = x;
+            if (contextX + 212.0f > layout.table.right) {
+                contextX = std::max(layout.table.left + 8.0f, layout.table.right - 212.0f);
+            }
+            contextY = y;
+            float height = 3.0f * 30.0f + 12.0f;
+            if (contextY + height > layout.table.bottom) {
+                contextY = layout.table.bottom - height;
+            }
+            contextOpen = true;
+            hoverContextItem = -1;
+            InvalidateRect(window, nullptr, FALSE);
+            return;
+        }
+    }
+    contextOpen = false;
+    InvalidateRect(window, nullptr, FALSE);
+}
+
 int App::entry_at(float y) {
     if (y < layout.header.bottom) {
         return -1;
@@ -1009,7 +1190,8 @@ void App::paint_summary() {
 void App::paint_rail() {
     const D2D1_RECT_F& rail = layout.rail;
     fill(rail, kBg);
-    stroke_line(rail.right - 0.5f, rail.top, rail.right - 0.5f, rail.bottom, kHair);
+    bool separatorHot = hoverRailSep || dragRail;
+    stroke_line(rail.right - 0.5f, rail.top, rail.right - 0.5f, rail.bottom, separatorHot ? kAmber : kHair);
 
     text(fSmall, L"SOURCE", D2D1::RectF(16.0f, rail.top + 18.0f, 120.0f, rail.top + 34.0f), kFaint);
 
@@ -1541,6 +1723,47 @@ void App::paint_scan_overlay() {
          DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
+void App::paint_context() {
+    if (!contextOpen) {
+        return;
+    }
+    float itemH = 30.0f;
+    float width = 200.0f;
+    float height = 3.0f * itemH + 12.0f;
+    D2D1_RECT_F menu = D2D1::RectF(contextX, contextY, contextX + width, contextY + height);
+
+    D2D1_RECT_F shadow = D2D1::RectF(menu.left + 2.0f, menu.top + 3.0f, menu.right + 2.0f, menu.bottom + 3.0f);
+    fill_round(shadow, 8.0f, rgb(0x000000, 0.5f));
+    fill_round(menu, 8.0f, kRaised);
+    brush->SetColor(kHair);
+    target->DrawRoundedRectangle(D2D1::RoundedRect(menu, 8.0f, 8.0f), brush, 1.0f);
+
+    struct Item {
+        const wchar_t* label;
+        ID2D1Bitmap* icon;
+    };
+    Item items[3] = {{L"Open folder", glyphFolder}, {L"Copy path", glyphCopy}, {L"Copy jump list path", glyphCopy}};
+    for (int i = 0; i < 3; ++i) {
+        bool enabled = context_item_enabled(i);
+        bool hot = hoverContextItem == i && enabled;
+        D2D1_RECT_F rect = D2D1::RectF(menu.left + 4.0f, menu.top + 6.0f + itemH * static_cast<float>(i),
+                                       menu.right - 4.0f, menu.top + 6.0f + itemH * (static_cast<float>(i) + 1.0f));
+        if (hot) {
+            fill_round(rect, 5.0f, kSelect);
+        }
+        ID2D1Bitmap* icon = items[i].icon;
+        if (icon != nullptr) {
+            float iconSize = 14.0f;
+            D2D1_RECT_F iconRect = D2D1::RectF(rect.left + 8.0f, rect.top + (itemH - iconSize) * 0.5f,
+                                               rect.left + 8.0f + iconSize, rect.top + (itemH + iconSize) * 0.5f);
+            target->DrawBitmap(icon, iconRect, enabled ? 1.0f : 0.35f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+        text(fBody, items[i].label,
+             D2D1::RectF(rect.left + 30.0f, rect.top, rect.right - 8.0f, rect.bottom),
+             enabled ? (hot ? kText : kDim) : kFaint);
+    }
+}
+
 void App::render() {
     if (!create_devices() || !ensure_target()) {
         return;
@@ -1555,6 +1778,7 @@ void App::render() {
     paint_drawer();
     paint_status();
     paint_scan_overlay();
+    paint_context();
     HRESULT result = target->EndDraw();
     if (result == D2DERR_RECREATE_TARGET) {
         drop_target();
@@ -1568,9 +1792,25 @@ void App::on_mouse_move(float x, float y) {
     int previousMode = hoverMode;
     int previousFilter = hoverFilter;
     int previousSep = hoverSep;
+    int previousRail = hoverRailSep ? 1 : 0;
     mouseX = x;
     mouseY = y;
 
+    if (contextOpen) {
+        int previousItem = hoverContextItem;
+        hoverContextItem = context_item_at(x, y);
+        if (hoverContextItem != previousItem) {
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return;
+    }
+    if (dragRail) {
+        float dx = x - dragRailStartX;
+        railW = std::min(std::max(dragRailBase + dx, 200.0f), 420.0f);
+        compute_layout();
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
     if (dragSep >= 0) {
         float tableWidth = layout.table.right - layout.table.left;
         float avail = tableWidth - 96.0f;
@@ -1590,6 +1830,7 @@ void App::on_mouse_move(float x, float y) {
         return;
     }
     hoverSep = separator_at(x, y);
+    hoverRailSep = !dragSep && rail_separator_at(x, y);
     hoverRow = -1;
     hoverSource = -1;
     hoverBucket = -1;
@@ -1637,7 +1878,8 @@ void App::on_mouse_move(float x, float y) {
         }
     }
     if (previousRow != hoverRow || previousSource != hoverSource || previousBucket != hoverBucket ||
-        previousMode != hoverMode || previousFilter != hoverFilter || previousSep != hoverSep) {
+        previousMode != hoverMode || previousFilter != hoverFilter || previousSep != hoverSep ||
+        previousRail != (hoverRailSep ? 1 : 0)) {
         InvalidateRect(window, nullptr, FALSE);
     }
 }
@@ -1646,6 +1888,25 @@ void App::on_click(float x, float y) {
     auto inside = [&](const D2D1_RECT_F& rect) {
         return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     };
+    if (contextOpen) {
+        int item = context_item_at(x, y);
+        if (item >= 0 && context_item_enabled(item)) {
+            execute_context(item);
+        }
+        contextOpen = false;
+        hoverContextItem = -1;
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
+    if (rail_separator_at(x, y)) {
+        dragRail = true;
+        dragRailStartX = x;
+        dragRailBase = railW;
+        hoverRailSep = true;
+        SetCapture(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
     int sep = separator_at(x, y);
     if (sep >= 0) {
         dragSep = sep;
@@ -1861,6 +2122,12 @@ void App::on_key(int key) {
         return;
     }
     if (key == VK_ESCAPE) {
+        if (contextOpen) {
+            contextOpen = false;
+            hoverContextItem = -1;
+            InvalidateRect(window, nullptr, FALSE);
+            return;
+        }
         if (searchFocused) {
             searchFocused = false;
             query.clear();
@@ -1977,9 +2244,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wParam, LPARAM lP
                 app->compute_layout();
                 InvalidateRect(window, nullptr, FALSE);
             }
+            if (app->dragRail) {
+                app->dragRail = false;
+                ReleaseCapture();
+                app->compute_layout();
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        case WM_RBUTTONDOWN:
+            app->on_context_menu(static_cast<float>(GET_X_LPARAM(lParam)) / app->scale,
+                                 static_cast<float>(GET_Y_LPARAM(lParam)) / app->scale);
             return 0;
         case WM_SETCURSOR:
-            if (app->dragSep >= 0 || app->hoverSep >= 0) {
+            if (app->dragSep >= 0 || app->hoverSep >= 0 || app->dragRail || app->hoverRailSep) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
             }

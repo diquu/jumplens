@@ -11,6 +11,7 @@ struct DiscoverStats {
     int directories = 0;
     int files = 0;
     int found = 0;
+    int skipped = 0;
     bool budgetReached = false;
     bool stopped = false;
 };

@@ -3,6 +3,12 @@
 #include "text.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cwctype>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace jl {
 namespace {
@@ -10,8 +16,29 @@ namespace {
 constexpr size_t kMaxEntries = 6000000;
 constexpr int kMaxDepth = 96;
 
+bool contains_ci_nofree(const std::wstring& haystack, const wchar_t* needle) {
+    size_t n = wcslen(needle);
+    size_t m = haystack.size();
+    if (n == 0 || n > m) {
+        return false;
+    }
+    for (size_t i = 0; i + n <= m; ++i) {
+        size_t j = 0;
+        for (; j < n; ++j) {
+            if (towlower(haystack[i + j]) != towlower(needle[j])) {
+                break;
+            }
+        }
+        if (j == n) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool jump_list_name(const std::wstring& name) {
-    return contains_ci(name, L".automaticdestinations-ms") || contains_ci(name, L".customdestinations-ms");
+    return contains_ci_nofree(name, L".automaticdestinations-ms") ||
+           contains_ci_nofree(name, L".customdestinations-ms");
 }
 
 bool skip_entry(const WIN32_FIND_DATAW& data) {
@@ -24,32 +51,82 @@ bool skip_entry(const WIN32_FIND_DATAW& data) {
     return false;
 }
 
-struct Walker {
-    DiscoverRequest request;
-    DiscoverStats* stats = nullptr;
-    std::vector<std::wstring> results;
-    size_t visited = 0;
-    int lastReport = 0;
+struct Frame {
+    std::wstring path;
+    int depth = 0;
 };
 
-bool stop_requested(Walker& walker) {
-    return walker.request.stop != nullptr && walker.request.stop->load();
+struct Shared {
+    const DiscoverRequest* request = nullptr;
+    std::atomic<long long> visited{0};
+    std::atomic<long long> files{0};
+    std::atomic<long long> directories{0};
+    std::atomic<long long> found{0};
+    std::atomic<long long> skipped{0};
+    std::atomic<long long> pending{0};
+    std::atomic<long long> lastReportMs{0};
+    std::atomic<long long> abort{0};
+    std::mutex queueLock;
+    std::condition_variable cv;
+    std::deque<Frame> queue;
+    std::mutex resultsLock;
+    std::vector<std::wstring> results;
+    std::mutex progressLock;
+};
+
+bool stopping(const Shared& shared) {
+    if (shared.abort.load() != 0) {
+        return true;
+    }
+    return shared.request->stop != nullptr && shared.request->stop->load();
 }
 
-void walk(Walker& walker, const std::wstring& root) {
-    struct Frame {
-        std::wstring path;
-        int depth = 0;
-    };
-    std::vector<Frame> stack;
-    stack.push_back({root, 0});
-    while (!stack.empty()) {
-        if (stop_requested(walker)) {
-            walker.stats->stopped = true;
-            return;
+void report(Shared& shared, const std::wstring& folder, bool force) {
+    if (shared.request->progress == nullptr) {
+        return;
+    }
+    long long now = GetTickCount64();
+    long long last = shared.lastReportMs.load();
+    if (!force && now - last < 150) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(shared.progressLock);
+    if (!force && now - shared.lastReportMs.load() < 150) {
+        return;
+    }
+    shared.lastReportMs = now;
+    DiscoverStats snapshot;
+    snapshot.directories = static_cast<int>(shared.directories.load());
+    snapshot.files = static_cast<int>(shared.files.load());
+    snapshot.found = static_cast<int>(shared.found.load());
+    snapshot.skipped = static_cast<int>(shared.skipped.load());
+    snapshot.budgetReached = shared.abort.load() != 0;
+    snapshot.stopped = shared.request->stop != nullptr && shared.request->stop->load();
+    shared.request->progress(folder, snapshot);
+}
+
+std::wstring join_path(const std::wstring& base, const std::wstring& name) {
+    std::wstring out = base;
+    if (!out.empty() && out.back() != L'\\') {
+        out += L'\\';
+    }
+    out += name;
+    return out;
+}
+
+void worker(Shared& shared) {
+    for (;;) {
+        Frame frame;
+        {
+            std::unique_lock<std::mutex> lock(shared.queueLock);
+            shared.cv.wait(lock, [&] { return !shared.queue.empty() || shared.pending.load() == 0; });
+            if (shared.queue.empty()) {
+                return;
+            }
+            frame = std::move(shared.queue.front());
+            shared.queue.pop_front();
         }
-        Frame frame = stack.back();
-        stack.pop_back();
+
         std::wstring pattern = frame.path;
         if (!pattern.empty() && pattern.back() != L'\\') {
             pattern += L'\\';
@@ -57,56 +134,57 @@ void walk(Walker& walker, const std::wstring& root) {
         pattern += L'*';
         WIN32_FIND_DATAW data{};
         HANDLE handle = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
-                                        FIND_FIRST_EX_LARGE_FETCH);
+                                         FIND_FIRST_EX_LARGE_FETCH);
         if (handle == INVALID_HANDLE_VALUE) {
+            shared.skipped++;
+            report(shared, frame.path, false);
+            shared.pending--;
+            shared.cv.notify_all();
             continue;
         }
         do {
-            if (stop_requested(walker)) {
-                FindClose(handle);
-                walker.stats->stopped = true;
-                return;
+            if (stopping(shared)) {
+                break;
             }
             if (skip_entry(data)) {
                 continue;
             }
-            ++walker.visited;
-            if (walker.visited > kMaxEntries) {
-                walker.stats->budgetReached = true;
-                FindClose(handle);
-                return;
+            long long seen = ++shared.visited;
+            if (seen > static_cast<long long>(kMaxEntries)) {
+                shared.abort = 1;
+                break;
             }
-            std::wstring child = frame.path;
-            if (!child.empty() && child.back() != L'\\') {
-                child += L'\\';
-            }
-            child += data.cFileName;
             bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             if (directory) {
-                ++walker.stats->directories;
-                if (frame.depth < kMaxDepth) {
-                    stack.push_back({child, frame.depth + 1});
+                ++shared.directories;
+                if (frame.depth + 1 > kMaxDepth) {
+                    shared.abort = 1;
                 } else {
-                    walker.stats->budgetReached = true;
-                }
-                if (walker.stats->directories - walker.lastReport >= 400) {
-                    walker.lastReport = walker.stats->directories;
-                    if (walker.request.progress) {
-                        walker.request.progress(frame.path, *walker.stats);
+                    std::wstring child = join_path(frame.path, data.cFileName);
+                    shared.pending++;
+                    {
+                        std::lock_guard<std::mutex> lock(shared.queueLock);
+                        shared.queue.push_back({std::move(child), frame.depth + 1});
                     }
+                    shared.cv.notify_one();
                 }
+                report(shared, frame.path, false);
             } else {
-                ++walker.stats->files;
+                ++shared.files;
                 if (jump_list_name(data.cFileName)) {
-                    walker.results.push_back(child);
-                    ++walker.stats->found;
-                    if (walker.request.progress) {
-                        walker.request.progress(frame.path, *walker.stats);
+                    std::wstring child = join_path(frame.path, data.cFileName);
+                    {
+                        std::lock_guard<std::mutex> lock(shared.resultsLock);
+                        shared.results.push_back(std::move(child));
                     }
+                    ++shared.found;
+                    report(shared, frame.path, true);
                 }
             }
-        } while (FindNextFileW(handle, &data));
+        } while (FindNextFileW(handle, &data) != FALSE);
         FindClose(handle);
+        shared.pending--;
+        shared.cv.notify_all();
     }
 }
 
@@ -151,26 +229,52 @@ std::vector<std::wstring> volumes() {
 
 std::vector<std::wstring> discover_jump_lists(const DiscoverRequest& request, DiscoverStats& stats) {
     stats = DiscoverStats();
-    Walker walker;
-    walker.request = request;
-    walker.stats = &stats;
+    Shared shared;
+    shared.request = &request;
+
     std::vector<std::wstring> roots = request.everywhere ? volumes() : standard_roots();
+    std::vector<Frame> initial;
     for (const std::wstring& root : roots) {
         DWORD attributes = GetFileAttributesW(root.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             continue;
         }
-        if (request.progress) {
-            request.progress(root, stats);
-        }
-        walk(walker, root);
-        if (stats.stopped || stats.budgetReached) {
-            break;
-        }
+        initial.push_back({root, 0});
     }
-    std::sort(walker.results.begin(), walker.results.end());
-    walker.results.erase(std::unique(walker.results.begin(), walker.results.end()), walker.results.end());
-    return walker.results;
+    if (request.progress) {
+        DiscoverStats snapshot;
+        request.progress(initial.empty() ? std::wstring() : initial.front().path, snapshot);
+    }
+    {
+        std::lock_guard<std::mutex> lock(shared.queueLock);
+        for (Frame& frame : initial) {
+            shared.queue.push_back(std::move(frame));
+        }
+        shared.pending = static_cast<long long>(shared.queue.size());
+    }
+
+    unsigned threadCount = std::min(6u, std::max(2u, std::thread::hardware_concurrency() / 2));
+    threadCount = std::max(1u, std::min<unsigned>(threadCount, static_cast<unsigned>(shared.pending.load())));
+    std::vector<std::thread> threads;
+    threads.reserve(threadCount);
+    for (unsigned i = 0; i < threadCount; ++i) {
+        threads.emplace_back(worker, std::ref(shared));
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    stats.directories = static_cast<int>(shared.directories.load());
+    stats.files = static_cast<int>(shared.files.load());
+    stats.found = static_cast<int>(shared.found.load());
+    stats.skipped = static_cast<int>(shared.skipped.load());
+    stats.budgetReached = shared.abort.load() != 0;
+    stats.stopped = request.stop != nullptr && request.stop->load();
+
+    std::vector<std::wstring> results = std::move(shared.results);
+    std::sort(results.begin(), results.end());
+    results.erase(std::unique(results.begin(), results.end()), results.end());
+    return results;
 }
 
 }

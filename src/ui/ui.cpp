@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include "logo_data.h"
+#include "glyph_data.h"
 
 #include "../core/export.h"
 #include "../core/scan.h"
@@ -99,6 +100,12 @@ struct App {
     ID2D1HwndRenderTarget* target = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
     ID2D1Bitmap* logo = nullptr;
+    ID2D1Bitmap* glyphSearch = nullptr;
+    ID2D1Bitmap* glyphSearchAmber = nullptr;
+    ID2D1Bitmap* glyphRefresh = nullptr;
+    ID2D1Bitmap* glyphDownload = nullptr;
+    ID2D1Bitmap* glyphEmpty = nullptr;
+    ID2D1LinearGradientBrush* brushHistogram = nullptr;
     IDWriteInlineObject* ellipsis = nullptr;
 
     IDWriteTextFormat* fWord = nullptr;
@@ -149,7 +156,17 @@ struct App {
     int hoverFilter = -1;
     bool searchFocused = false;
     int caret = 0;
-    int hoverColumn = -1;
+    float mouseX = -1.0f;
+    float mouseY = -1.0f;
+    float colAppW = -1.0f;
+    float colTargetW = -1.0f;
+    float colCountW = -1.0f;
+    int dragSep = -1;
+    int hoverSep = -1;
+    float dragStartX = 0.0f;
+    float dragBaseApp = 0.0f;
+    float dragBaseTarget = 0.0f;
+    float dragBaseCount = 0.0f;
 
     Layout layout;
     std::vector<int> railOrder;
@@ -163,8 +180,11 @@ struct App {
             scan.stop = true;
             worker.join();
         }
-        if (brush != nullptr) brush->Release();
-        if (ellipsis != nullptr) ellipsis->Release();
+        drop_target();
+        if (ellipsis != nullptr) {
+            ellipsis->Release();
+            ellipsis = nullptr;
+        }
         for (IDWriteTextFormat** format : {&fWord, &fHead, &fBody, &fBold, &fSmall, &fMono, &fMonoSmall, &fStat,
                                            &fWrap, &fWrapBold}) {
             if (*format != nullptr) {
@@ -172,11 +192,8 @@ struct App {
                 *format = nullptr;
             }
         }
-        if (target != nullptr) target->Release();
         if (dwrite != nullptr) dwrite->Release();
         if (d2d != nullptr) d2d->Release();
-        brush = nullptr;
-        target = nullptr;
         dwrite = nullptr;
         d2d = nullptr;
     }
@@ -254,32 +271,67 @@ struct App {
         }
         target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         target->CreateSolidColorBrush(kText, &brush);
-        build_logo();
+        build_bitmaps();
         return brush != nullptr;
     }
 
-    void build_logo() {
-        if (logo != nullptr || target == nullptr) {
-            return;
-        }
-        std::vector<uint32_t> pixels(static_cast<size_t>(kLogoWidth) * static_cast<size_t>(kLogoHeight));
+    ID2D1Bitmap* tinted_mask(const unsigned char* mask, const D2D1_COLOR_F& color) {
+        std::vector<uint32_t> pixels(static_cast<size_t>(kGlyphSize) * static_cast<size_t>(kGlyphSize));
+        uint32_t red = static_cast<uint32_t>(color.r * 255.0f + 0.5f);
+        uint32_t green = static_cast<uint32_t>(color.g * 255.0f + 0.5f);
+        uint32_t blue = static_cast<uint32_t>(color.b * 255.0f + 0.5f);
         for (size_t i = 0; i < pixels.size(); ++i) {
-            uint32_t alpha = kLogoAlpha[i];
-            uint32_t red = (0xE8u * alpha) / 255u;
-            uint32_t green = (0xA3u * alpha) / 255u;
-            uint32_t blue = (0x3Cu * alpha) / 255u;
-            pixels[i] = (alpha << 24) | (red << 16) | (green << 8) | blue;
+            uint32_t alpha = mask[i];
+            uint32_t r = (red * alpha) / 255u;
+            uint32_t g = (green * alpha) / 255u;
+            uint32_t b = (blue * alpha) / 255u;
+            pixels[i] = (alpha << 24) | (r << 16) | (g << 8) | b;
         }
         D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
-        target->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(kLogoWidth), static_cast<UINT32>(kLogoHeight)),
-                             pixels.data(), static_cast<UINT32>(kLogoWidth) * 4u, properties, &logo);
+        ID2D1Bitmap* bitmap = nullptr;
+        target->CreateBitmap(D2D1::SizeU(kGlyphSize, kGlyphSize), pixels.data(), kGlyphSize * 4u, properties,
+                             &bitmap);
+        return bitmap;
+    }
+
+    void build_bitmaps() {
+        if (target == nullptr || logo != nullptr) {
+            return;
+        }
+        D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        target->CreateBitmap(D2D1::SizeU(kLogoWidth, kLogoHeight), kLogoPixels, kLogoWidth * 4u, properties, &logo);
+        glyphSearch = tinted_mask(kGlyphSearch, kDim);
+        glyphSearchAmber = tinted_mask(kGlyphSearch, kAmber);
+        glyphRefresh = tinted_mask(kGlyphRefresh, kDim);
+        glyphDownload = tinted_mask(kGlyphDownload, kAmber);
+        glyphEmpty = tinted_mask(kGlyphEmpty, kAmber);
+
+        D2D1_GRADIENT_STOP stops[2] = {};
+        stops[0] = {0.0f, rgb(0xF6C964)};
+        stops[1] = {1.0f, rgb(0x8A5A16)};
+        ID2D1GradientStopCollection* collection = nullptr;
+        if (SUCCEEDED(target->CreateGradientStopCollection(stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP,
+                                                            &collection))) {
+            D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES gradient = D2D1::LinearGradientBrushProperties(
+                D2D1::Point2F(0.0f, 0.0f), D2D1::Point2F(0.0f, 1.0f));
+            target->CreateLinearGradientBrush(gradient, collection, &brushHistogram);
+            collection->Release();
+        }
     }
 
     void drop_target() {
-        if (logo != nullptr) {
-            logo->Release();
-            logo = nullptr;
+        if (brushHistogram != nullptr) {
+            brushHistogram->Release();
+            brushHistogram = nullptr;
+        }
+        for (ID2D1Bitmap** bitmap : {&logo, &glyphSearch, &glyphSearchAmber, &glyphRefresh, &glyphDownload,
+                                     &glyphEmpty}) {
+            if (*bitmap != nullptr) {
+                (*bitmap)->Release();
+                *bitmap = nullptr;
+            }
         }
         if (brush != nullptr) {
             brush->Release();
@@ -361,6 +413,7 @@ struct App {
     void on_key(int key);
     void export_csv();
     int entry_at(float y);
+    int separator_at(float x, float y) const;
     void ensure_visible(int position);
     const Entry* selected_entry() const;
     const SourceInfo* source_of(const Entry& entry) const;
@@ -447,16 +500,25 @@ void App::compute_layout() {
     float tableWidth = layout.table.right - layout.table.left;
     float colPin = 34.0f;
     float colNum = 62.0f;
-    float colApp = std::min(196.0f, tableWidth * 0.24f);
-    float colCount = 74.0f;
-    float colModified = 164.0f;
-    float colTarget = std::max(120.0f, tableWidth - colPin - colNum - colApp - colCount - colModified);
+    float avail = std::max(240.0f, tableWidth - colPin - colNum);
+    if (colAppW < 0.0f) {
+        colAppW = std::max(100.0f, std::min(196.0f, avail * 0.24f));
+    }
+    colAppW = std::min(std::max(colAppW, 90.0f), avail - 120.0f - 46.0f - 150.0f);
+    if (colCountW < 0.0f) {
+        colCountW = 74.0f;
+    }
+    colCountW = std::min(std::max(colCountW, 46.0f), avail - colAppW - 120.0f - 150.0f);
+    if (colTargetW < 0.0f) {
+        colTargetW = avail - colAppW - colCountW;
+    }
+    colTargetW = std::min(std::max(colTargetW, 120.0f), avail - colAppW - colCountW - 150.0f);
     layout.colPin = layout.table.left;
     layout.colNum = layout.colPin + colPin;
     layout.colApp = layout.colNum + colNum;
-    layout.colTarget = layout.colApp + colApp;
-    layout.colCount = layout.colTarget + colTarget;
-    layout.colModified = layout.colCount + colCount;
+    layout.colTarget = layout.colApp + colAppW;
+    layout.colCount = layout.colTarget + colTargetW;
+    layout.colModified = layout.colCount + colCountW;
 
     float statsRight = layout.table.right;
     float statsLeft = layout.rail.right + 24.0f;
@@ -738,6 +800,22 @@ void App::finish_scan() {
     InvalidateRect(window, nullptr, FALSE);
 }
 
+int App::separator_at(float x, float y) const {
+    if (y < layout.header.top || y > layout.header.bottom) {
+        return -1;
+    }
+    if (std::fabs(x - layout.colTarget) <= 5.0f) {
+        return 0;
+    }
+    if (std::fabs(x - layout.colCount) <= 5.0f) {
+        return 1;
+    }
+    if (std::fabs(x - layout.colModified) <= 5.0f) {
+        return 2;
+    }
+    return -1;
+}
+
 int App::entry_at(float y) {
     if (y < layout.header.bottom) {
         return -1;
@@ -774,38 +852,63 @@ void App::paint_top() {
     fill(top, kBg);
     stroke_line(top.left, top.bottom - 0.5f, top.right, top.bottom - 0.5f, kHair);
 
-    fill_round(D2D1::RectF(24.0f, 17.0f, 54.0f, 47.0f), 8.0f, kAmber);
     if (logo != nullptr) {
-        D2D1_RECT_F icon = D2D1::RectF(30.0f, 23.0f, 48.0f, 41.0f);
+        D2D1_RECT_F icon = D2D1::RectF(22.0f, 15.0f, 56.0f, 49.0f);
         target->DrawBitmap(logo, icon, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
-    text(fWord, kAppName, D2D1::RectF(64.0f, 16.0f, 220.0f, 40.0f), kText);
-    text(fSmall, L"jump list parser", D2D1::RectF(64.0f, 38.0f, 220.0f, 52.0f), kFaint);
+    text(fWord, kAppName, D2D1::RectF(64.0f, 12.0f, 220.0f, 36.0f), kText);
+    float wordW = text_width(fWord, kAppName);
+    text(fWord, L".", D2D1::RectF(64.0f + wordW + 1.5f, 12.0f, 64.0f + wordW + 14.0f, 36.0f), kAmber);
+    text(fSmall, L"jump list parser", D2D1::RectF(64.0f, 34.0f, 220.0f, 50.0f), kFaint);
 
     bool focus = searchFocused;
-    fill_round(layout.search, 8.0f, focus ? kRaised : kPanel);
+    fill_round(layout.search, 9.0f, focus ? kRaised : kPanel);
+    if (focus) {
+        brush->SetColor(rgb(0xE8A33C, 0.18f));
+        target->DrawRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(layout.search.left - 2.0f, layout.search.top - 2.0f,
+                                          layout.search.right + 2.0f, layout.search.bottom + 2.0f),
+                              11.0f, 11.0f),
+            brush, 2.0f);
+    }
     brush->SetColor(focus ? kAmber : kHair);
-    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.search, 8.0f, 8.0f), brush, 1.0f);
-    stroke_line(layout.search.left + 14.0f, layout.search.top + 11.0f, layout.search.left + 14.0f, layout.search.top + 11.0f,
-                kDim);
+    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.search, 9.0f, 9.0f), brush, 1.0f);
+    ID2D1Bitmap* magnifier = focus ? glyphSearchAmber : glyphSearch;
+    if (magnifier != nullptr) {
+        float iconSize = 15.0f;
+        float iconY = (layout.search.top + layout.search.bottom - iconSize) * 0.5f;
+        D2D1_RECT_F iconRect = D2D1::RectF(layout.search.left + 10.0f, iconY,
+                                           layout.search.left + 10.0f + iconSize, iconY + iconSize);
+        target->DrawBitmap(magnifier, iconRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
     std::wstring display = query;
-    D2D1_RECT_F textRect = D2D1::RectF(layout.search.left + 14.0f, layout.search.top + 5.0f,
+    D2D1_RECT_F textRect = D2D1::RectF(layout.search.left + 31.0f, layout.search.top + 5.0f,
                                        layout.search.right - 14.0f, layout.search.bottom - 5.0f);
     if (display.empty() && !focus) {
-        text(fBody, L"Search targets, hosts, AppIDs", textRect, kFaint);
+        text(fBody, L"Search targets, hosts, AppIDs   (Ctrl+F)", textRect, kFaint);
     } else {
         text(fBody, display, textRect, kText);
     }
 
-    auto button = [this](const D2D1_RECT_F& rect, const wchar_t* label, bool primary, bool hovered, bool enabled) {
-        D2D1_COLOR_F bg = primary ? (hovered ? rgb(0x1B1F20) : kRaised) : (hovered ? kRaised : kBg);
+    auto button = [this](const D2D1_RECT_F& rect, const wchar_t* label, bool primary, bool hovered, bool enabled,
+                         ID2D1Bitmap* glyph) {
+        D2D1_COLOR_F bg = primary ? (hovered ? rgb(0x2C2312) : rgb(0x262011)) : (hovered ? kRaised : kBg);
         fill_round(rect, 8.0f, bg);
-        brush->SetColor(primary ? kHair : (hovered ? kHair : kHair));
+        brush->SetColor(primary ? rgb(0xE8A33C, hovered ? 0.75f : 0.45f) : (hovered ? kAmber : kHair));
         target->DrawRoundedRectangle(D2D1::RoundedRect(rect, 8.0f, 8.0f), brush, 1.0f);
-        text(fHead, label, rect, enabled ? (primary ? kText : kDim) : kFaint, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (glyph != nullptr) {
+            float iconSize = 15.0f;
+            float iconY = (rect.top + rect.bottom - iconSize) * 0.5f;
+            D2D1_RECT_F iconRect = D2D1::RectF(rect.left + 12.0f, iconY, rect.left + 12.0f + iconSize,
+                                               iconY + iconSize);
+            target->DrawBitmap(glyph, iconRect, enabled ? 1.0f : 0.35f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+        text(fHead, label, D2D1::RectF(rect.left + 30.0f, rect.top, rect.right - 4.0f, rect.bottom),
+             enabled ? (primary ? rgb(0xF8D98E) : (hovered ? kText : kDim)) : kFaint,
+             DWRITE_TEXT_ALIGNMENT_CENTER);
     };
-    button(layout.rescan, scanning ? L"Scanning" : L"Rescan", false, hoverRow == -2, !scanning);
-    button(layout.exportButton, L"Export CSV", true, hoverRow == -3, !dataset.entries.empty());
+    button(layout.rescan, scanning ? L"Scanning" : L"Rescan", false, hoverRow == -2, !scanning, glyphRefresh);
+    button(layout.exportButton, L"Export CSV", true, hoverRow == -3, !dataset.entries.empty(), glyphDownload);
 }
 
 void App::paint_summary() {
@@ -838,6 +941,9 @@ void App::paint_summary() {
         text(fSmall, stat.label, D2D1::RectF(x, labelY, x + blockW, labelY + 14.0f), kFaint);
         text(wide ? fBody : fStat, stat.value,
              D2D1::RectF(x, valueY, x + blockW, valueY + 26.0f), i == 2 && dataset.pinned > 0 ? kAmber : kText);
+        if (!wide) {
+            stroke_line(x + blockW + 6.0f, summary.top + 22.0f, x + blockW + 6.0f, summary.bottom - 22.0f, kHair);
+        }
         x += blockW + (wide ? 0.0f : 14.0f);
     }
 
@@ -865,8 +971,21 @@ void App::paint_summary() {
         float bx = left + slot * static_cast<float>(i) + (slot - barW) * 0.5f;
         bool active = !dayFilter.empty() && dayFilter == bucket.day;
         bool hot = hoverBucket == i;
-        D2D1_COLOR_F color = active ? kAmber : (hot ? rgb(0xE8A33C, 0.55f) : rgb(0x3A4245));
-        fill(D2D1::RectF(bx, bottom - height, bx + barW, bottom), color);
+        D2D1_RECT_F barRect = D2D1::RectF(bx, bottom - height, bx + barW, bottom);
+        if (active) {
+            fill_round(barRect, 2.0f, kAmber);
+        } else if (hot) {
+            fill_round(barRect, 2.0f, rgb(0xE8A33C, 0.55f));
+        } else if (brushHistogram != nullptr) {
+            brushHistogram->SetTransform(D2D1::Matrix3x2F::Translation(bx, bottom - height) *
+                                         D2D1::Matrix3x2F::Scale(1.0f, std::max(1.0f, height)));
+            target->FillRoundedRectangle(D2D1::RoundedRect(barRect, 2.0f, 2.0f), brushHistogram);
+        } else {
+            fill(barRect, rgb(0x3A4245));
+        }
+    }
+    if (brushHistogram != nullptr) {
+        brushHistogram->SetTransform(D2D1::Matrix3x2F::Identity());
     }
     if (hoverBucket >= 0 && hoverBucket < count) {
         const Bucket& bucket = buckets[static_cast<size_t>(hoverBucket)];
@@ -1029,6 +1148,16 @@ void App::paint_table() {
              active ? kText : kFaint, column.align);
     }
 
+    auto separator = [&](float x, int index) {
+        bool active = hoverSep == index || dragSep == index;
+        brush->SetColor(active ? kAmber : kHair);
+        target->DrawLine(D2D1::Point2F(x, header.top + 9.0f), D2D1::Point2F(x, header.bottom - 9.0f), brush,
+                         active ? 1.5f : 1.0f);
+    };
+    separator(layout.colTarget, 0);
+    separator(layout.colCount, 1);
+    separator(layout.colModified, 2);
+
     target->PushAxisAlignedClip(D2D1::RectF(table.left, header.bottom, table.right, table.bottom),
                                 D2D1_ANTIALIAS_MODE_ALIASED);
 
@@ -1116,10 +1245,18 @@ void App::paint_table() {
         std::wstring hint = dataset.sources.empty()
                                 ? L"Nothing on this machine matched the jump list file names."
                                 : L"Clear the search or pick another source.";
-        float centerY = (layout.header.bottom + table.bottom) * 0.5f - 23.0f;
-        text(fBold, title, D2D1::RectF(table.left, centerY, table.right, centerY + 22.0f), kText,
+        float centerY = (layout.header.bottom + table.bottom) * 0.5f;
+        if (glyphEmpty != nullptr) {
+            float iconSize = 54.0f;
+            D2D1_RECT_F iconRect = D2D1::RectF(table.left + (table.right - table.left - iconSize) * 0.5f,
+                                               centerY - 72.0f,
+                                               table.left + (table.right - table.left + iconSize) * 0.5f,
+                                               centerY - 72.0f + iconSize);
+            target->DrawBitmap(glyphEmpty, iconRect, 0.30f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+        text(fBold, title, D2D1::RectF(table.left, centerY - 12.0f, table.right, centerY + 10.0f), kText,
              DWRITE_TEXT_ALIGNMENT_CENTER);
-        text(fSmall, hint, D2D1::RectF(table.left, centerY + 24.0f, table.right, centerY + 44.0f), kFaint,
+        text(fSmall, hint, D2D1::RectF(table.left, centerY + 14.0f, table.right, centerY + 32.0f), kFaint,
              DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 }
@@ -1131,6 +1268,16 @@ void App::paint_details(const Entry& entry, const SourceInfo* source, const D2D1
 
     std::wstring title = entry.appName;
     text(fBold, title, D2D1::RectF(x, y, x + width, y + 24.0f), kText);
+    if (entry.pinned) {
+        std::wstring pin = L"PINNED";
+        float chipW = text_width(fSmall, pin) + 18.0f;
+        D2D1_RECT_F chip = D2D1::RectF(x + width - chipW, y + 2.0f, x + width, y + 20.0f);
+        brush->SetColor(kAmberSoft);
+        target->FillRoundedRectangle(D2D1::RoundedRect(chip, 4.0f, 4.0f), brush);
+        brush->SetColor(kAmber);
+        target->DrawRoundedRectangle(D2D1::RoundedRect(chip, 4.0f, 4.0f), brush, 1.0f);
+        text(fSmall, pin, chip, kAmber, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
     y += 26.0f;
     std::wstring subtitle = entry.automatic ? L"automatic destinations" : L"custom destinations";
     if (!entry.category.empty()) {
@@ -1301,8 +1448,11 @@ void App::paint_status() {
             right += L"  /  " + format_int(static_cast<long long>(hiddenFilters)) + L" hidden by filters";
         }
         right += L"  /  " + format_int(static_cast<long long>(dataset.filesScanned)) + L" files visited  /  " +
-                 mode_text() + L"  /  " +
-                 format_int(static_cast<long long>(std::llround(dataset.seconds))) + L"s";
+                 mode_text();
+        if (scan.skipped > 0) {
+            right += L"  /  " + format_int(scan.skipped) + L" not accessible";
+        }
+        right += L"  /  " + format_int(static_cast<long long>(std::llround(dataset.seconds))) + L"s";
     } else {
         right = L"ready";
     }
@@ -1333,6 +1483,9 @@ void App::paint_scan_overlay() {
     if (phase == 0) {
         detail = format_int(scan.directories.load()) + L" folders  /  " + format_int(scan.files.load()) +
                  L" files  /  " + format_int(scan.found.load()) + L" found";
+        if (scan.skipped > 0) {
+            detail += L"  /  " + format_int(scan.skipped) + L" not accessible";
+        }
     } else {
         detail = format_int(scan.parsed.load()) + L" of " + format_int(scan.found.load()) + L" files  /  " +
                  format_int(scan.entryCount.load()) + L" entries";
@@ -1386,6 +1539,29 @@ void App::on_mouse_move(float x, float y) {
     int previousBucket = hoverBucket;
     int previousMode = hoverMode;
     int previousFilter = hoverFilter;
+    int previousSep = hoverSep;
+    mouseX = x;
+    mouseY = y;
+
+    if (dragSep >= 0) {
+        float tableWidth = layout.table.right - layout.table.left;
+        float avail = tableWidth - 96.0f;
+        float dx = x - dragStartX;
+        if (dragSep == 0) {
+            colAppW = std::min(std::max(dragBaseApp + dx, 90.0f),
+                               std::max(90.0f, avail - colTargetW - colCountW - 150.0f));
+        } else if (dragSep == 1) {
+            colTargetW = std::min(std::max(dragBaseTarget + dx, 120.0f),
+                                  std::max(120.0f, avail - colAppW - colCountW - 150.0f));
+        } else {
+            colCountW = std::min(std::max(dragBaseCount + dx, 46.0f),
+                                 std::max(46.0f, avail - colAppW - colTargetW - 150.0f));
+        }
+        compute_layout();
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
+    hoverSep = separator_at(x, y);
     hoverRow = -1;
     hoverSource = -1;
     hoverBucket = -1;
@@ -1433,7 +1609,7 @@ void App::on_mouse_move(float x, float y) {
         }
     }
     if (previousRow != hoverRow || previousSource != hoverSource || previousBucket != hoverBucket ||
-        previousMode != hoverMode || previousFilter != hoverFilter) {
+        previousMode != hoverMode || previousFilter != hoverFilter || previousSep != hoverSep) {
         InvalidateRect(window, nullptr, FALSE);
     }
 }
@@ -1442,6 +1618,18 @@ void App::on_click(float x, float y) {
     auto inside = [&](const D2D1_RECT_F& rect) {
         return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     };
+    int sep = separator_at(x, y);
+    if (sep >= 0) {
+        dragSep = sep;
+        dragStartX = x;
+        dragBaseApp = colAppW;
+        dragBaseTarget = colTargetW;
+        dragBaseCount = colCountW;
+        hoverSep = sep;
+        SetCapture(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
     if (inside(layout.search)) {
         searchFocused = true;
         caret = static_cast<int>(query.size());
@@ -1548,10 +1736,31 @@ void App::on_click(float x, float y) {
 }
 
 void App::on_wheel(float delta) {
+    if (mouseX < 0.0f || mouseY < 0.0f) {
+        return;
+    }
+    if (mouseY < layout.header.top || mouseY > layout.table.bottom || mouseX < layout.table.left ||
+        mouseX > layout.table.right) {
+        return;
+    }
     float viewHeight = layout.table.bottom - layout.header.bottom;
     float maxScroll = std::max(0.0f, static_cast<float>(visible.size()) * layout.rowHeight - viewHeight);
-    scroll -= delta / 120.0f * 84.0f;
+    UINT lines = 3;
+    if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0)) {
+        lines = 3;
+    }
+    float step;
+    if (lines == static_cast<UINT>(0xFFFFFFFF)) {
+        step = viewHeight;
+    } else {
+        step = static_cast<float>(std::max(1u, lines)) * layout.rowHeight;
+    }
+    scroll -= (delta / 120.0f) * step;
     scroll = std::min(std::max(0.0f, scroll), maxScroll);
+    int position = entry_at(mouseY);
+    if (hoverRow != position) {
+        hoverRow = position;
+    }
     InvalidateRect(window, nullptr, FALSE);
 }
 
@@ -1708,6 +1917,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             app->on_click(static_cast<float>(GET_X_LPARAM(lParam)) / app->scale,
                           static_cast<float>(GET_Y_LPARAM(lParam)) / app->scale);
             return 0;
+        case WM_LBUTTONUP:
+            if (app->dragSep >= 0) {
+                app->dragSep = -1;
+                ReleaseCapture();
+                app->compute_layout();
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        case WM_SETCURSOR:
+            if (app->dragSep >= 0 || app->hoverSep >= 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return TRUE;
+            }
+            return DefWindowProcW(window, message, wParam, lParam);
         case WM_MOUSEWHEEL:
             app->on_wheel(static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)));
             return 0;

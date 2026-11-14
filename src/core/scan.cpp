@@ -21,6 +21,7 @@ void run_scan(Dataset& dataset, ScanState& state, bool everywhere) {
     state.parsed = 0;
     state.entryCount = 0;
     state.budgetReached = false;
+    state.skipped = 0;
     state.set_current(L"Looking for jump list files");
 
     double start = now_seconds();
@@ -39,6 +40,7 @@ void run_scan(Dataset& dataset, ScanState& state, bool everywhere) {
     state.directories = stats.directories;
     state.files = stats.files;
     state.found = stats.found;
+    state.skipped = stats.skipped;
     state.budgetReached = stats.budgetReached;
     dataset.scanSeconds = now_seconds() - start;
     dataset.filesScanned = stats.files;

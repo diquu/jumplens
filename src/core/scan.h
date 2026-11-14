@@ -15,6 +15,7 @@ struct ScanState {
     std::atomic<int> found{0};
     std::atomic<int> parsed{0};
     std::atomic<int> entryCount{0};
+    std::atomic<int> skipped{0};
     std::atomic<bool> stop{false};
     std::atomic<bool> finished{false};
     std::atomic<bool> budgetReached{false};

@@ -57,7 +57,8 @@ In the window:
     signed. Verification uses Authenticode for embedded signatures and the Windows catalog (SHA256 lookup, SHA1
     member tag) for the rest, so a renamed or replaced file cannot pass as Windows. Entries with no target, or a
     target outside a filesystem path, are never hidden. It ships on
-- clicking a column header sorts; `Ctrl+F` focuses the search; `Ctrl+E` exports
+- clicking a column header sorts; dragging a separator in the header resizes that column; `Ctrl+F` focuses the
+  search; `Ctrl+E` exports
 - selecting a row opens the details drawer with the target, the timestamps, the tracker GUIDs and the source file
 - `F5` rescans
 
@@ -89,9 +90,11 @@ The AppID to application mapping in `data/appids.txt` comes from Eric Zimmerman'
 [JLECmd](https://github.com/EricZimmerman/JLECmd) project, used under the MIT license. The table is vendored as a
 plain text file and compiled into the executable by `tools/gen_appids.ps1`.
 
-The clock glyph drawn inside the logo tile is
-[Phosphor Icons](https://phosphoricons.com) (`clock-counter-clockwise`), used under the MIT license. `data/logo.svg`
-is the original asset and `tools/gen_logo.ps1` rasterizes it into `data/logo.png`.
+The logo tile and the toolbar glyphs (`list-magnifying-glass`, `magnifying-glass`, `arrow-clockwise`,
+`download-simple`) are [Phosphor Icons](https://phosphoricons.com), used under the MIT license. `data/logo.svg` is
+the composed tile and `data/icons/` holds the glyph sources. `tools/gen_logo.ps1` and `tools/gen_glyphs.ps1`
+rasterize them into the premultiplied assets baked into the executable; `data/logo.png` and `data/icons/` stay
+around as the reproducible sources.
 
 The parsers, the discovery walk and the interface are original C++.
 

@@ -148,6 +148,9 @@ struct App {
     std::vector<Bucket> buckets;
 
     float scroll = 0.0f;
+    float railScroll = 0.0f;
+    float drawerScroll = 0.0f;
+    float drawerContentHeight = 0.0f;
     int selected = -1;
     int hoverRow = -1;
     int hoverSource = -1;
@@ -648,6 +651,7 @@ void App::rebuild() {
     for (size_t i = 0; i < dataset.sources.size(); ++i) {
         railOrder.push_back(static_cast<int>(i));
     }
+    railScroll = 0.0f;
     std::stable_sort(railOrder.begin(), railOrder.end(), [this](int a, int b) {
         int left = sourceCounts[static_cast<size_t>(a)];
         int right = sourceCounts[static_cast<size_t>(b)];
@@ -794,6 +798,7 @@ void App::finish_scan() {
         worker.join();
     }
     scanning = false;
+    done = false;
     rebuild_buckets();
     rebuild();
     scroll = 0.0f;
@@ -1061,7 +1066,6 @@ void App::paint_rail() {
     toggle(layout.filterBoot, L"In instance only", bootOnly, hoverFilter == 0, bootHint);
     toggle(layout.filterNoise, L"Reduce noise", reduceNoise, hoverFilter == 1, noiseHint);
 
-    float y = layout.railList.top;
     struct Row {
         std::wstring title;
         std::wstring count;
@@ -1084,9 +1088,21 @@ void App::paint_rail() {
     }
 
     float itemH = 42.0f;
-    int hoverItem = -1;
+    float contentHeight = static_cast<float>(rows.size()) * itemH;
+    float viewHeight = layout.railList.bottom - layout.railList.top;
+    float maxRailScroll = std::max(0.0f, contentHeight - viewHeight);
+    if (railScroll > maxRailScroll) {
+        railScroll = maxRailScroll;
+    }
+
+    float y = layout.railList.top - railScroll;
+    target->PushAxisAlignedClip(layout.railList, D2D1_ANTIALIAS_MODE_ALIASED);
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (y + itemH > rail.bottom - 6.0f) {
+        if (y + itemH < layout.railList.top) {
+            y += itemH;
+            continue;
+        }
+        if (y > layout.railList.bottom) {
             break;
         }
         const Row& row = rows[i];
@@ -1105,6 +1121,17 @@ void App::paint_rail() {
         text(fMonoSmall, count, D2D1::RectF(rail.right - 62.0f, y + 2.0f, rail.right - 14.0f, y + itemH - 2.0f),
              active ? kAmber : kFaint, DWRITE_TEXT_ALIGNMENT_TRAILING);
         y += itemH;
+    }
+    target->PopAxisAlignedClip();
+
+    if (maxRailScroll > 0.0f) {
+        fill(D2D1::RectF(rail.right - 4.0f, layout.railList.top + 2.0f, rail.right - 2.0f,
+                         layout.railList.bottom - 2.0f),
+             rgb(0x181D1E));
+        float thumbHeight = std::max(30.0f, viewHeight * (viewHeight / contentHeight));
+        float thumbTop = layout.railList.top + 2.0f +
+                         (viewHeight - 4.0f - thumbHeight) * (railScroll / maxRailScroll);
+        fill(D2D1::RectF(rail.right - 4.0f, thumbTop, rail.right - 2.0f, thumbTop + thumbHeight), rgb(0x39454A));
     }
 }
 
@@ -1264,7 +1291,7 @@ void App::paint_table() {
 void App::paint_details(const Entry& entry, const SourceInfo* source, const D2D1_RECT_F& area) {
     float x = area.left + 22.0f;
     float width = area.right - x - 22.0f;
-    float y = area.top + 20.0f;
+    float y = area.top + 20.0f - drawerScroll;
 
     std::wstring title = entry.appName;
     text(fBold, title, D2D1::RectF(x, y, x + width, y + 24.0f), kText);
@@ -1406,6 +1433,7 @@ void App::paint_details(const Entry& entry, const SourceInfo* source, const D2D1
         row(L"notes", source->notes);
     }
     row(L"notes", entry.notes);
+    drawerContentHeight = y + drawerScroll - area.top;
 }
 
 void App::paint_drawer() {
@@ -1594,8 +1622,8 @@ void App::on_mouse_move(float x, float y) {
     if (y > layout.header.bottom && y < layout.table.bottom && x > layout.table.left && x < layout.table.right) {
         hoverRow = entry_at(y);
     }
-    if (y > layout.railList.top && x < layout.rail.right) {
-        int index = static_cast<int>((y - layout.railList.top) / 42.0f);
+    if (y > layout.railList.top && x < layout.rail.right && y < layout.railList.bottom) {
+        int index = static_cast<int>((y - layout.railList.top + railScroll) / 42.0f);
         if (index >= 0) {
             hoverSource = index;
         }
@@ -1660,6 +1688,7 @@ void App::on_click(float x, float y) {
         bootOnly = !bootOnly;
         rebuild();
         selected = -1;
+        drawerScroll = 0.0f;
         scroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
         return;
@@ -1668,6 +1697,7 @@ void App::on_click(float x, float y) {
         reduceNoise = !reduceNoise;
         rebuild();
         selected = -1;
+        drawerScroll = 0.0f;
         scroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
         return;
@@ -1676,6 +1706,7 @@ void App::on_click(float x, float y) {
         inside(D2D1::RectF(layout.drawer.right - 42.0f, layout.drawer.top + 16.0f, layout.drawer.right - 18.0f,
                            layout.drawer.top + 40.0f))) {
         selected = -1;
+        drawerScroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
         return;
     }
@@ -1684,6 +1715,7 @@ void App::on_click(float x, float y) {
         dayFilter = dayFilter == day ? std::wstring() : day;
         rebuild();
         selected = -1;
+        drawerScroll = 0.0f;
         scroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
         return;
@@ -1706,8 +1738,8 @@ void App::on_click(float x, float y) {
         InvalidateRect(window, nullptr, FALSE);
         return;
     }
-    if (y > layout.railList.top && x < layout.rail.right) {
-        int index = static_cast<int>((y - layout.railList.top) / 42.0f);
+    if (y > layout.railList.top && y < layout.railList.bottom && x < layout.rail.right) {
+        int index = static_cast<int>((y - layout.railList.top + railScroll) / 42.0f);
         if (index >= 0) {
             int filter = -1;
             if (index == 0) {
@@ -1728,38 +1760,57 @@ void App::on_click(float x, float y) {
     if (position >= 0) {
         const Entry& entry = dataset.entries[static_cast<size_t>(visible[static_cast<size_t>(position)])];
         selected = entry.id;
+        drawerScroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
     } else if (y > layout.header.bottom && y < layout.table.bottom) {
         selected = -1;
+        drawerScroll = 0.0f;
         InvalidateRect(window, nullptr, FALSE);
     }
 }
 
 void App::on_wheel(float delta) {
-    if (mouseX < 0.0f || mouseY < 0.0f) {
-        return;
-    }
-    if (mouseY < layout.header.top || mouseY > layout.table.bottom || mouseX < layout.table.left ||
-        mouseX > layout.table.right) {
-        return;
-    }
-    float viewHeight = layout.table.bottom - layout.header.bottom;
-    float maxScroll = std::max(0.0f, static_cast<float>(visible.size()) * layout.rowHeight - viewHeight);
     UINT lines = 3;
     if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0)) {
         lines = 3;
     }
+    float lineStep = static_cast<float>(std::max(1u, lines));
+
+    if (mouseX >= 0.0f && mouseY >= 0.0f && mouseX < layout.rail.right && mouseY > layout.railList.top &&
+        mouseY < layout.railList.bottom) {
+        float contentHeight = static_cast<float>(railOrder.size() + 1) * 42.0f;
+        float viewHeight = layout.railList.bottom - layout.railList.top;
+        float maxRail = std::max(0.0f, contentHeight - viewHeight);
+        railScroll -= (delta / 120.0f) * lineStep * 42.0f;
+        railScroll = std::min(std::max(0.0f, railScroll), maxRail);
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
+    if (selected >= 0 && mouseX >= layout.drawer.left && mouseX <= layout.drawer.right &&
+        mouseY >= layout.drawer.top && mouseY <= layout.drawer.bottom) {
+        float viewHeight = layout.drawer.bottom - layout.drawer.top;
+        float maxDrawer = std::max(0.0f, drawerContentHeight - viewHeight);
+        drawerScroll -= (delta / 120.0f) * lineStep * 46.0f;
+        drawerScroll = std::min(std::max(0.0f, drawerScroll), maxDrawer);
+        InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
+    float viewHeight = layout.table.bottom - layout.header.bottom;
+    float maxScroll = std::max(0.0f, static_cast<float>(visible.size()) * layout.rowHeight - viewHeight);
     float step;
     if (lines == static_cast<UINT>(0xFFFFFFFF)) {
         step = viewHeight;
     } else {
-        step = static_cast<float>(std::max(1u, lines)) * layout.rowHeight;
+        step = lineStep * layout.rowHeight;
     }
     scroll -= (delta / 120.0f) * step;
     scroll = std::min(std::max(0.0f, scroll), maxScroll);
-    int position = entry_at(mouseY);
-    if (hoverRow != position) {
-        hoverRow = position;
+    if (mouseY >= layout.header.bottom && mouseY <= layout.table.bottom && mouseX >= layout.table.left &&
+        mouseX <= layout.table.right) {
+        int position = entry_at(mouseY);
+        if (hoverRow != position) {
+            hoverRow = position;
+        }
     }
     InvalidateRect(window, nullptr, FALSE);
 }
@@ -1817,6 +1868,7 @@ void App::on_key(int key) {
             rebuild();
         } else {
             selected = -1;
+            drawerScroll = 0.0f;
         }
         InvalidateRect(window, nullptr, FALSE);
         return;
@@ -1839,6 +1891,7 @@ void App::on_key(int key) {
         }
         if (next >= 0 && next < static_cast<int>(visible.size())) {
             selected = dataset.entries[static_cast<size_t>(visible[static_cast<size_t>(next)])].id;
+            drawerScroll = 0.0f;
             ensure_visible(next);
             InvalidateRect(window, nullptr, FALSE);
         }
